@@ -1,125 +1,148 @@
-//! Scripting engine to run scripts based on tags.
+//! Scripting Engine to run scripts based on tags.
+//!
 //! This module serves to filter and run the scripts selected by the user.
 //!
 //! A new commandline and configuration file option was added.
 //!
-//! --scripts
+//! ## `--scripts`
 //!
-//!      default
-//!          This is the default behavior, like as it was from the beginning of RustScan.
-//!          The user do not have to chose anything for this. This is the only script embedded in RustScan running as default.
+//! ### `default`
 //!
-//!      none
-//!          The user have to use the --scripts none commandline argument or scripts = "none" in the config file.
-//!          None of the scripts will run, this replaces the removed --no-nmap option.
+//! This is the default behavior, like as it was from the beginning of RustScan.
 //!
-//!      custom
-//!          The user have to use the --scripts custom commandline argument or scripts = "custom" in the config file.
-//!          Rustscan will look for the script configuration file in the user's home dir: home_dir/.rustscan_scripts.toml
-//!          The config file have 3 optional fields, tag, developer and port. Just the tag field will be used forther in the process.
-//!          RustScan will also look for available scripts in the user's home dir: home_dir/.rustscan_scripts
-//!          and will try to read all the files, and parse them into a vector of ScriptFiles.
-//!          Filtering on tags means the tags found in the rustscan_scripts.toml file will also have to be present in the Scriptfile,
-//!          otherwise the script will not be selected.
-//!          All of the rustscan_script.toml tags have to be present at minimum in a Scriptfile to get selected, but can be also more.
+//! The user do not have to chose anything for this. This is the only script
+//! embedded in RustScan running as default.
+//!
+//! ### `none`
+//!
+//! The user have to use the `--scripts none` commandline argument or `scripts =
+//! "none"` in the config file.
+//!
+//! None of the scripts will run, this replaces the removed `--no-nmap` option.
+//!
+//! ### `custom`
+//!
+//! The user have to use the `--scripts custom` commandline argument or
+//! `scripts = "custom"` in the config file.
+//!
+//! RustScan will look for the script configuration file in the user's home
+//! dir: `home_dir/.rustscan_scripts.toml`
+//!
+//! The config file have 3 optional fields: `tag`, `developer` and `port`. Just
+//! the `tag` field will be used forther in the process.
+//!
+//! RustScan will also look for available scripts in the user's home dir:
+//! `home_dir/.rustscan_scripts` and will try to read all the files, and parse
+//! them into a vector of [`ScriptFile`].
+//!
+//! Filtering on tags means the tags found in the `rustscan_scripts.toml` file
+//! will also have to be present in the [`ScriptFile`], otherwise the script
+//! will not be selected.
+//!
+//! All of the `rustscan_script.toml` tags have to be present at minimum in a
+//! [`ScriptFile`] to get selected, but can be also more.
 //!
 //! Config file example:
-//! fixtures/test_rustscan_scripts.toml
+//!
+//! - `fixtures/test_rustscan_scripts.toml`
 //!
 //! Script file examples:
-//! fixtures/test_script.py
-//! fixtures/test_script.pl
-//! fixtures/test_script.sh
-//! fixtures/test_script.txt
 //!
-//! call_format in script files can be of 2 variants.
-//! One is where all of the possible tags {{script}} {{ip}} {{port}} are there.
-//!     The {{script}} part will be replaced with the scriptfile full path gathered while parsing available scripts.
-//!     The {{ip}} part will be replaced with the ip we got from the scan.
-//!     The {{port}} part will be reaplced with the ports separated with the ports_separator found in the script file
+//! - `fixtures/test_script.py`
+//! - `fixtures/test_script.pl`
+//! - `fixtures/test_script.sh`
+//! - `fixtures/test_script.txt`
 //!
-//! And when there is only {{ip}} and {{port}} is in the format, ony those will be replaced with the arguments from the scan.
-//! This makes it easy to run a system installed command like nmap, and give any kind of arguments to it.
+//! `call_format` in script files can be of 2 variants:
 //!
-//! If the format is different, the script will be silently discarded and will not run. With the Debug option it's possible to see where it goes wrong.
+//! One is where all of the possible tags `{{script}}`, `{{ip}}` and `{{port}}`
+//! are there.
+//!
+//! - The `{{script}}` part will be replaced with the scriptfile full path
+//!   gathered while parsing available scripts.
+//! - The `{{ip}}` part will be replaced with the ip we got from the scan.
+//! - The `{{port}}` part will be reaplced with the ports separated with the
+//!   `ports_separator` found in the script file
+//!
+//! And when there is only `{{ip}}` and `{{port}}` is in the format, only those
+//! will be replaced with the arguments from the scan.
+//!
+//! This makes it easy to run a system installed command like `nmap`, and give
+//! any kind of arguments to it.
+//!
+//! If the format is different, the script will be silently discarded and will
+//! not run. With the `Debug` option it's possible to see where it goes wrong.
 
 #![allow(clippy::module_name_repetitions)]
 
 use crate::input::ScriptsRequired;
 use anyhow::{anyhow, Result};
+use log::debug;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::convert::TryInto;
 use std::fs::{self, File};
 use std::io::{self, prelude::*};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::string::ToString;
-use subprocess::{Exec, ExitStatus};
 use text_placeholder::Template;
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 
 static DEFAULT: &str = r#"tags = ["core_approved", "RustScan", "default"]
 developer = [ "RustScan", "https://github.com/RustScan" ]
 ports_separator = ","
-call_format = "nmap -vvv -p {{port}} {{ip}}"
+call_format = "nmap -vvv -p {{port}} -{{ipversion}} {{ip}}"
 "#;
 
 #[cfg(not(tarpaulin_include))]
-pub fn init_scripts(scripts: ScriptsRequired) -> Result<Vec<ScriptFile>> {
+pub fn init_scripts(scripts: &ScriptsRequired) -> Result<Vec<ScriptFile>> {
     let mut scripts_to_run: Vec<ScriptFile> = Vec::new();
 
     match scripts {
-        ScriptsRequired::None => Ok(scripts_to_run),
+        ScriptsRequired::None => {}
         ScriptsRequired::Default => {
             let default_script =
-                toml::from_str::<ScriptFile>(&DEFAULT).expect("Failed to parse Script file.");
+                toml::from_str::<ScriptFile>(DEFAULT).expect("Failed to parse Script file.");
             scripts_to_run.push(default_script);
-            Ok(scripts_to_run)
         }
         ScriptsRequired::Custom => {
-            let scripts_dir_base = match dirs::home_dir() {
-                Some(dir) => dir,
-                None => return Err(anyhow!("Could not infer scripts path.")),
-            };
-            let script_paths = match find_scripts(scripts_dir_base) {
-                Ok(script_paths) => script_paths,
-                Err(e) => return Err(anyhow!(e)),
-            };
+            let scripts_dir_base =
+                dirs::home_dir().ok_or_else(|| anyhow!("Could not infer scripts path."))?;
+            let script_paths = find_scripts(scripts_dir_base)?;
             debug!("Scripts paths \n{:?}", script_paths);
 
             let parsed_scripts = parse_scripts(script_paths);
             debug!("Scripts parsed \n{:?}", parsed_scripts);
 
-            let script_config = match ScriptConfig::read_config() {
-                Ok(script_config) => script_config,
-                Err(e) => return Err(anyhow!(e)),
-            };
+            let script_config = ScriptConfig::read_config()?;
             debug!("Script config \n{:?}", script_config);
 
             // Only Scripts that contain all the tags found in ScriptConfig will be selected.
-            if script_config.tags.is_some() {
-                let config_hashset: HashSet<String> =
-                    script_config.tags.unwrap().into_iter().collect();
-                for script in &parsed_scripts {
-                    if script.tags.is_some() {
-                        let script_hashset: HashSet<String> =
-                            script.tags.clone().unwrap().into_iter().collect();
-                        if config_hashset.is_subset(&script_hashset) {
-                            scripts_to_run.push(script.to_owned());
+            if let Some(config_hashset) = script_config.tags {
+                for script in parsed_scripts {
+                    if let Some(script_hashset) = &script.tags {
+                        if script_hashset
+                            .iter()
+                            .all(|tag| config_hashset.contains(tag))
+                        {
+                            scripts_to_run.push(script);
                         } else {
                             debug!(
                                 "\nScript tags does not match config tags {:?} {}",
                                 &script_hashset,
-                                script.path.clone().unwrap().display()
+                                script.path.unwrap().display()
                             );
                         }
                     }
                 }
             }
             debug!("\nScript(s) to run {:?}", scripts_to_run);
-            Ok(scripts_to_run)
         }
     }
+
+    Ok(scripts_to_run)
 }
 
 pub fn parse_scripts(scripts: Vec<PathBuf>) -> Vec<ScriptFile> {
@@ -134,6 +157,7 @@ pub fn parse_scripts(scripts: Vec<PathBuf>) -> Vec<ScriptFile> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Script {
     // Path to the script itself.
     path: Option<PathBuf>,
@@ -162,12 +186,14 @@ struct ExecPartsScript {
     script: String,
     ip: String,
     port: String,
+    ipversion: String,
 }
 
 #[derive(Serialize)]
 struct ExecParts {
     ip: String,
     port: String,
+    ipversion: String,
 }
 
 impl Script {
@@ -222,39 +248,66 @@ impl Script {
                 script: self.path.unwrap().to_str().unwrap().to_string(),
                 ip: self.ip.to_string(),
                 port: ports_str,
+                ipversion: match &self.ip {
+                    IpAddr::V4(_) => String::from("4"),
+                    IpAddr::V6(_) => String::from("6"),
+                },
             };
             to_run = default_template.fill_with_struct(&exec_parts_script)?;
         } else {
             let exec_parts: ExecParts = ExecParts {
                 ip: self.ip.to_string(),
                 port: ports_str,
+                ipversion: match &self.ip {
+                    IpAddr::V4(_) => String::from("4"),
+                    IpAddr::V6(_) => String::from("6"),
+                },
             };
             to_run = default_template.fill_with_struct(&exec_parts)?;
         }
         debug!("\nScript format to run {}", to_run);
-
-        let arguments = shell_words::split(&to_run).expect("Failed to parse script arguments");
-
-        execute_script(arguments)
+        execute_script(&to_run)
     }
 }
 
 #[cfg(not(tarpaulin_include))]
-fn execute_script(mut arguments: Vec<String>) -> Result<String> {
-    debug!("\nScript arguments vec: {:?}", &arguments);
-    let process = Exec::cmd(&arguments.remove(0)).args(&arguments);
-    match process.capture() {
-        Ok(c) => {
-            let es = match c.exit_status {
-                ExitStatus::Exited(c) => c.try_into().unwrap(),
-                ExitStatus::Signaled(c) => c.into(),
-                ExitStatus::Other(c) => c,
-                ExitStatus::Undetermined => -1,
+fn execute_script(script: &str) -> Result<String> {
+    debug!("\nScript arguments {}", script);
+
+    let (cmd, arg) = if cfg!(unix) {
+        ("sh", "-c")
+    } else {
+        ("cmd.exe", "/c")
+    };
+
+    match Command::new(cmd)
+        .args([arg, script])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => {
+            let status = output.status;
+
+            let es = match status.code() {
+                Some(code) => code,
+                _ => {
+                    #[cfg(unix)]
+                    {
+                        status.signal().unwrap()
+                    }
+
+                    #[cfg(windows)]
+                    {
+                        return Err(anyhow!("Unknown exit status"));
+                    }
+                }
             };
+
             if es != 0 {
                 return Err(anyhow!("Exit code = {}", es));
             }
-            Ok(c.stdout_str())
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
         Err(error) => {
             debug!("Command error {}", error.to_string());
@@ -293,16 +346,14 @@ impl ScriptFile {
         let real_path = script.clone();
         let mut lines_buf = String::new();
         if let Ok(file) = File::open(script) {
-            for line in io::BufReader::new(file).lines().skip(1) {
-                if let Ok(mut line) = line {
-                    if line.starts_with('#') {
-                        line.retain(|c| c != '#');
-                        line = line.trim().to_string();
-                        line.push('\n');
-                        lines_buf.push_str(&line);
-                    } else {
-                        break;
-                    }
+            for mut line in io::BufReader::new(file).lines().skip(1).flatten() {
+                if line.starts_with('#') {
+                    line.retain(|c| c != '#');
+                    line = line.trim().to_string();
+                    line.push('\n');
+                    lines_buf.push_str(&line);
+                } else {
+                    break;
                 }
             }
         } else {
@@ -336,9 +387,8 @@ pub struct ScriptConfig {
 #[cfg(not(tarpaulin_include))]
 impl ScriptConfig {
     pub fn read_config() -> Result<ScriptConfig> {
-        let mut home_dir = match dirs::home_dir() {
-            Some(dir) => dir,
-            None => return Err(anyhow!("Could not infer ScriptConfig path.")),
+        let Some(mut home_dir) = dirs::home_dir() else {
+            return Err(anyhow!("Could not infer ScriptConfig path."));
         };
         home_dir.push(".rustscan_scripts.toml");
 
@@ -435,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_bash_script() {
         let script_f = ScriptFile::new("fixtures/.rustscan_scripts/test_script.sh".into()).unwrap();
         let script: Script = into_script(script_f);
@@ -456,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_perl_script() {
         let script_f = ScriptFile::new("fixtures/.rustscan_scripts/test_script.pl".into()).unwrap();
         let script: Script = into_script(script_f);
